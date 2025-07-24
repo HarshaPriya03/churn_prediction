@@ -1,0 +1,162 @@
+!pip install mysql-connector-python -q
+import mysql.connector
+
+#calls
+!pip install transformers accelerate -q
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+
+model_id = "google/flan-t5-xl"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_id).to(device)
+
+from datetime import datetime
+import mysql.connector
+
+# =========================
+# DB CONNECTION
+# =========================
+db_connection = mysql.connector.connect(
+    host="68.178.155.255",
+    user="Anika12",
+    password="Anika12",
+    database="categories_lead"
+)
+cursor = db_connection.cursor(dictionary=True)
+
+# =========================
+# MAIN PROCESS
+# =========================
+cursor.execute("SELECT DISTINCT lead_id FROM emails WHERE lead_id IS NOT NULL")
+lead_ids = cursor.fetchall()
+
+for row in lead_ids:
+    lead_id = row['lead_id']
+
+    # Get last_contact_date from lead_engagement_summary
+    cursor.execute("""
+        SELECT last_contact_date
+        FROM lead_engagement_summary
+        WHERE lead_id = %s
+    """, (lead_id,))
+    contact_row = cursor.fetchone()
+    last_contact_date = contact_row['last_contact_date'] if contact_row else None
+
+    # Step 1: Calculate inactivity_days as penalty (1 per 10 days)
+    penalty = 0
+    if last_contact_date:
+        days_diff = (datetime.now().date() - last_contact_date).days
+        penalty = days_diff // 10  # +1 for every 10 full days
+        print(f"📅 Lead {lead_id} → Days since last contact: {days_diff} → Penalty (inactivity_days): {penalty}")
+    else:
+        print(f"⚠️ Lead {lead_id} has no last_contact_date")
+
+    # Step 2: Fetch last 5 emails for sentiment analysis
+    cursor.execute("""
+        SELECT direction, body, timestamp
+        FROM emails
+        WHERE lead_id = %s
+        ORDER BY timestamp DESC
+        LIMIT 5
+    """, (lead_id,))
+    latest_emails = cursor.fetchall()
+    email_chain = list(reversed(latest_emails))  # oldest to newest
+
+    print(f"\n===== LEAD {lead_id} — Last 5 Email Pairs Analysis =====")
+    negative_count = 0
+    i = 0
+    while i < len(email_chain) - 1:
+        current = email_chain[i]
+        next_msg = email_chain[i + 1]
+
+        if current['direction'].lower() == 'sent' and next_msg['direction'].lower() == 'received':
+            sent_text = current['body'].strip()
+            received_text = next_msg['body'].strip()
+            pair_convo = f"sent: {sent_text}\nreceived: {received_text}"
+            prompt = build_negative_sentiment_flag_prompt(pair_convo)
+            output = run_model(prompt)
+
+            print(f"📨 Sent: {sent_text}")
+            print(f"📨 Received: {received_text}")
+            print(f"🧠 Model Output: {output}")
+
+            if output.lower() == "true":
+                negative_count += 1
+                print("🔴 Negative Sentiment Detected!")
+                print("------------------------------------------------")
+
+            i += 2  # skip to next non-overlapping pair
+        else:
+            i += 1  # skip if not a valid pair
+
+    # Step 3: Update lead_engagement_summary
+    cursor.execute("""
+        UPDATE lead_engagement_summary
+        SET negative_sentiment_count = %s,
+            inactivity_days = %s
+        WHERE lead_id = %s
+    """, (negative_count, penalty, lead_id))
+
+    print(f"🟡 Lead {lead_id} ➤ Sentiment Count: {negative_count}, Inactivity Penalty: {penalty}")
+
+# =========================
+# FINALIZE
+# =========================
+db_connection.commit()
+cursor.close()
+db_connection.close()
+print("\n✅ All updates complete in lead_engagement_summary.")
+
+
+db_connection.commit()
+cursor.close()
+db_connection.close()
+print("\n✅ All negative sentiment counts updated in lead_engagement_summary.")
+
+#test
+
+
+import mysql.connector
+from mysql.connector import OperationalError, errors
+
+def get_db_connection():
+    return mysql.connector.connect(
+        host="68.178.155.255",
+        user="Anika12",
+        password="Anika12",
+        database="categories_lead"
+    )
+
+def run_query_with_reconnect(cursor, query, params=None):
+    try:
+        cursor.execute(query, params)
+    except OperationalError as e:
+        if e.errno == 2055:
+            print("Lost connection, reconnecting...")
+            cursor.connection.reconnect(attempts=3, delay=5)
+            cursor.execute(query, params)
+        else:
+            raise e
+
+# Usage example
+db_connection = get_db_connection()
+cursor = db_connection.cursor(dictionary=True)
+
+cursor.execute("SELECT DISTINCT lead_id FROM lead_engagement_summary WHERE lead_id IS NOT NULL")
+lead_ids = cursor.fetchall()
+
+for row in lead_ids:
+    lead_id = row['lead_id']
+
+    # Using helper function to handle reconnects
+    run_query_with_reconnect(cursor, """
+        SELECT last_contact_date, inactivity_days, negative_sentiment_count
+        FROM lead_engagement_summary
+        WHERE lead_id = %s
+    """, (lead_id,))
+    summary = cursor.fetchone()
+    print(f"Lead {lead_id}: Last Contact {summary['last_contact_date'],summary['inactivity_days'],summary['negative_sentiment_count']}")
+
